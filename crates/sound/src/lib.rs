@@ -40,6 +40,8 @@ pub enum Error {
     InsufficientDescriptorSize(usize, usize),
     #[error("Failed to send notification")]
     SendNotificationFailed,
+    #[error("Stream with id {0} not found")]
+    StreamWithIdNotFound(u32),
     #[error("Invalid descriptor count {0}")]
     UnexpectedDescriptorCount(usize),
     #[error("Invalid descriptor size, expected: {0}, found: {1}")]
@@ -58,7 +60,7 @@ impl std::convert::From<Error> for IoError {
     }
 }
 
-#[derive(Default, Clone)]
+#[derive(Debug, Default, Clone)]
 pub struct PCMParams {
     pub features: Le32,
     /// size of hardware buffer in bytes
@@ -68,6 +70,7 @@ pub struct PCMParams {
     pub channels: u8,
     pub format: u8,
     pub rate: u8,
+    pub direction: u8,
 }
 
 #[derive(Debug, Clone)]

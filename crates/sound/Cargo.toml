@@ -12,7 +12,7 @@ edition = "2018"
 [features]
 default = ["null-backend", "pw-backend"]
 null-backend = []
-pw-backend = ["pipewire", "libspa", "pipewire-sys", "libspa-sys", "bindgen"]
+pw-backend = ["pipewire", "bindgen"]
 
 [dependencies]
 clap = { version = "4.1",  features = ["derive"] }
@@ -25,10 +25,7 @@ virtio-bindings = "0.2"
 virtio-queue = "0.7"
 vm-memory = "0.10"
 vmm-sys-util = "0.11"
-pipewire = { version = "0.6.0", optional = true }
-libspa = { version = "0.6.0", optional = true }
-pipewire-sys = { version = "0.6.0", optional = true }
-libspa-sys = { version = "0.6.0", optional = true }
+pipewire = { git = "https://gitlab.freedesktop.org/pipewire/pipewire-rs.git", rev = "a144cbd249ce4de34140c3e5e5c70490180cdc05", optional = true }
 bindgen = { version = "0.64.0", optional = true }
 
 [dev-dependencies]
