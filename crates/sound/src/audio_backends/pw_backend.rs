@@ -12,6 +12,7 @@ use crate::virtio_sound::{
 use crate::Error;
 use crate::PCMParams;
 use crate::Result;
+use log::error;
 use std::{
     cmp,
     collections::HashMap,
@@ -216,7 +217,7 @@ impl AudioBackend for PwBackend {
     }
 
     fn prepare(&self, stream_id: u32) -> Result<()> {
-        dbg!("pipewire backend, PREPARE function");
+        println!("pipewire backend, prepare function");
         let mut stream_states = self.stream_states.write().unwrap();
         let mut stream_hash = self.stream_hash.write().unwrap();
         let mut stream_listener = self.stream_listener.write().unwrap();
@@ -271,18 +272,17 @@ impl AudioBackend for PwBackend {
         let param: *mut spa_pod =
             unsafe { spa_format_audio_raw_build(&mut b, SPA_PARAM_EnumFormat, &mut info) };
 
-        if stream_states[stream_id as usize] == VIRTIO_SND_R_PCM_SET_PARAMS {
-            let mut stream = pw::stream::Stream::<i32>::new(
-                &self.core,
-                "audio-output",
-                properties! {
-                    *pw::keys::MEDIA_TYPE => "Audio",
-                    *pw::keys::MEDIA_CATEGORY => "Playback",
-                    *pw::keys::MEDIA_ROLE => "Music",
-                },
-            )
-            .expect("could not create new stream");
+        let mut stream = pw::stream::Stream::<i32>::new(
+            &self.core,
+            "audio-output",
+            properties! {
+                *pw::keys::MEDIA_TYPE => "Audio",
+                *pw::keys::MEDIA_CATEGORY => "Playback",
+            },
+        )
+        .expect("could not create new stream");
 
+        if stream_states[stream_id as usize] == VIRTIO_SND_R_PCM_SET_PARAMS {
             let listener_stream = stream
                 .add_local_listener()
                 .state_changed(move |old, new| {
@@ -387,6 +387,32 @@ impl AudioBackend for PwBackend {
             self.thread_loop.unlock();
         }
 
+        Ok(())
+    }
+
+    fn release(&self, stream_id: u32) -> Result<()> {
+        println!("pipewire backend, release function");
+        self.thread_loop.lock();
+        let mut stream_states = self.stream_states.write().unwrap();
+        let stream_hash = self.stream_hash.read().unwrap();
+        let stream_listener = self.stream_listener.read().unwrap();
+
+        if let Some(stream) = stream_hash.get(&stream_id) {
+            stream.disconnect().expect("could not disconnect stream");
+        } else {
+            error!("stream not found for the given stream_id");
+        };
+        if let Some(stream_lis) = stream_listener.get(&stream_id) {
+            //unregister stream
+            std::mem::drop(stream_lis);
+        } else {
+            error!("stream listener not found for the given stream_id");
+        };
+
+        if stream_states[stream_id as usize] == VIRTIO_SND_R_PCM_PREPARE {
+            stream_states[stream_id as usize] = VIRTIO_SND_R_PCM_SET_PARAMS;
+        }
+        self.thread_loop.unlock();
         Ok(())
     }
 }
