@@ -14,7 +14,10 @@ use crate::PCMParams;
 use crate::{Error, Result};
 
 pub trait AudioBackend {
+    fn get_stream_state(&self, _stream_id: u32) -> Result<u32>;
+
     fn write(&self, stream_id: u32) -> Result<()>;
+
     fn read(&self, stream_id: u32) -> Result<()>;
 
     fn set_param(&self, _stream_id: u32, _params: PCMParams) -> Result<()> {
