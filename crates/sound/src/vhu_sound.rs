@@ -381,7 +381,36 @@ impl VhostUserSoundThread {
                         .map_err(|_| Error::DescriptorWriteFailed)?;
                     len = desc_response.len();
                 }
-                VIRTIO_SND_R_PCM_START | VIRTIO_SND_R_PCM_STOP | VIRTIO_SND_R_PCM_RELEASE => {
+                VIRTIO_SND_R_PCM_RELEASE => {
+                    let pcm_hdr = desc_chain
+                        .memory()
+                        .read_obj::<VirtioSoundPcmHeader>(desc_request.addr())
+                        .map_err(|_| Error::DescriptorReadFailed)?;
+                    let stream_id = u32::from(pcm_hdr.stream_id);
+                    let state = audio_backend.get_stream_state(stream_id)?;
+
+                    if state != VIRTIO_SND_R_PCM_PREPARE && state != VIRTIO_SND_R_PCM_STOP {
+                        error!(
+                            "Command {} is not allowed at {}",
+                            VIRTIO_SND_R_PCM_RELEASE, state
+                        );
+                        response = VirtioSoundHeader {
+                            code: VIRTIO_SND_S_NOT_SUPP.into(),
+                        };
+                    } else if audio_backend.release(stream_id).is_err() {
+                        error!("IO error during release()");
+                        response = VirtioSoundHeader {
+                            code: VIRTIO_SND_S_IO_ERR.into(),
+                        };
+                    }
+                    desc_chain
+                        .memory()
+                        .write_obj(response, desc_response.addr())
+                        .map_err(|_| Error::DescriptorWriteFailed)?;
+                    len = desc_response.len();
+                }
+
+                VIRTIO_SND_R_PCM_START | VIRTIO_SND_R_PCM_STOP => {
                     let pcm_hdr = desc_chain
                         .memory()
                         .read_obj::<VirtioSoundPcmHeader>(desc_request.addr())
