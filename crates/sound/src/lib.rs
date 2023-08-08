@@ -32,6 +32,8 @@ pub enum Error {
     AudioBackendNotSupported,
     #[error("Descriptor not found")]
     DescriptorNotFound,
+    #[error("Channel number not supported")]
+    ChannelNotSupported,
     #[error("Descriptor read failed")]
     DescriptorReadFailed,
     #[error("Descriptor write failed")]

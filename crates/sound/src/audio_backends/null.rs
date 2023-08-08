@@ -15,9 +15,9 @@ impl AudioBackend for NullBackend {
     fn get_stream_state(&self, _stream_id: u32) -> Result<u32> {
         Ok(0)
     }
-    fn write(&self, stream_id: u32) -> Result<()> {
+    fn write(&self, stream_id: u32, _req: &mut [u8]) -> Result<u32> {
         println!("null backend, writting to stream: {}", stream_id);
-        Ok(())
+        Ok(0)
     }
 
     fn read(&self, _stream_id: u32) -> Result<()> {

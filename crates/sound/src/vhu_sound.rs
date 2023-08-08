@@ -4,6 +4,7 @@ use std::mem::size_of;
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::{io::Result as IoResult, u16, u32, u64, u8};
+use std::thread;
 
 use log::{debug, error};
 use vhost::vhost_user::message::{VhostUserProtocolFeatures, VhostUserVirtioFeatures};
@@ -312,6 +313,7 @@ impl VhostUserSoundThread {
                     if state != 0
                         && state != VIRTIO_SND_R_PCM_SET_PARAMS
                         && state != VIRTIO_SND_R_PCM_PREPARE
+                        && state != VIRTIO_SND_R_PCM_RELEASE
                     {
                         error!(
                             "Command {} is not allowed at {}",
@@ -415,6 +417,7 @@ impl VhostUserSoundThread {
                         .memory()
                         .read_obj::<VirtioSoundPcmHeader>(desc_request.addr())
                         .map_err(|_| Error::DescriptorReadFailed)?;
+
                     let stream_id = u32::from(pcm_hdr.stream_id);
 
                     let state = audio_backend.get_stream_state(stream_id)?;
@@ -503,6 +506,8 @@ impl VhostUserSoundThread {
 
         debug!("Requests to tx: {}", requests.len());
 
+        let audio_backend = &self.audio_backend;
+
         for desc_chain in requests {
             let descriptors: Vec<_> = desc_chain.clone().collect();
             debug!("Sound request with n descriptors: {}", descriptors.len());
@@ -524,7 +529,7 @@ impl VhostUserSoundThread {
                 return Err(Error::UnexpectedReadableDescriptor(1));
             }
 
-            let response = VirtioSoundPcmStatus {
+            let mut response = VirtioSoundPcmStatus {
                 status: VIRTIO_SND_S_OK.into(),
                 latency_bytes: 0.into(),
             };
@@ -542,53 +547,97 @@ impl VhostUserSoundThread {
                 return Err(Error::UnexpectedWriteOnlyDescriptor(1));
             }
 
-            let mut all_bufs = Vec::<u8>::new();
-            let data_descs = &descriptors[1..descriptors.len() - 1];
-
-            for data in data_descs {
-                if data.is_write_only() {
-                    return Err(Error::UnexpectedWriteOnlyDescriptor(1));
-                }
-
-                let mut buf = vec![0u8; data.len() as usize];
-
-                desc_chain
-                    .memory()
-                    .read_slice(&mut buf, data.addr())
-                    .map_err(|_| Error::DescriptorReadFailed)?;
-
-                all_bufs.extend(buf);
-            }
-
             let hdr_request = desc_chain
                 .memory()
                 .read_obj::<VirtioSoundPcmXfer>(desc_request.addr())
                 .map_err(|_| Error::DescriptorReadFailed)?;
 
-            let _stream_id = hdr_request.stream_id.to_native();
+            let stream_id = hdr_request.stream_id.to_native();
 
-            // TODO: to invoke audio_backend.write(stream_id, all_bufs, len)
+            let state_result = audio_backend.get_stream_state(stream_id);
 
-            // 5.14.6.8.1.1
-            // The device MUST NOT complete the I/O request until the buffer is
-            // totally consumed.
-            desc_chain
-                .memory()
-                .write_obj(response, desc_response.addr())
-                .map_err(|_| Error::DescriptorWriteFailed)?;
+            let state = match state_result {
+                Ok(u32) => u32,
+                Err(error) => return Err(error),
+            };
 
-            let len = desc_response.len();
+            if state != VIRTIO_SND_R_PCM_PREPARE
+                && state != VIRTIO_SND_R_PCM_START
+            {
+                error!(
+                    "data in tx is not allowed at {} state",
+                    state
+                );
+                response = VirtioSoundPcmStatus {
+                    status: VIRTIO_SND_S_NOT_SUPP.into(),
+                    latency_bytes: 0.into(),
+                };
+            } else {
+                let mut all_bufs = Vec::<u8>::new();
+                let data_descs = &descriptors[1..last_desc];
 
-            if vring.add_used(desc_chain.head_index(), len).is_err() {
-                error!("Couldn't return used descriptors to the ring");
+                for data in data_descs {
+                    if data.is_write_only() {
+                        return Err(Error::UnexpectedWriteOnlyDescriptor(1));
+                    }
+
+                    let mut buf = vec![0u8; data.len() as usize];
+
+                    desc_chain
+                        .memory()
+                        .read_slice(&mut buf, data.addr())
+                        .map_err(|_| Error::DescriptorReadFailed)?;
+
+                    all_bufs.extend(buf);
+                }
+
+                let mut all_bufs_cloned = all_bufs.clone();
+                let audio_backend_cloned = audio_backend.clone();
+                let vring_cloned = vring.clone();
+                let desc_response_cloned = desc_response.clone();
+                let desc_chain_clone = desc_chain.clone();
+                let mut response_cloned = response.clone();
+
+                // TODO: spawn a thread to async respond to guest
+                thread::spawn(move|| {
+                    let mut start : u32 = 0;
+                    'write: loop {
+                        match audio_backend_cloned.write(stream_id, &mut all_bufs_cloned[start as usize..]) {
+                            Ok(len) => {
+                                start += len;
+                                if start == all_bufs.len() as u32 {
+                                    break 'write;
+                                }
+                                //println!("start: {} {}", start, all_bufs.len());
+                            }
+                            Err(_) => {
+                                response_cloned = VirtioSoundPcmStatus {
+                                    status: VIRTIO_SND_S_IO_ERR.into(),
+                                    latency_bytes: 0.into(),
+                                };
+                                debug!("IO error during write()");
+                                break 'write;
+                            }
+                        };
+                    };
+                    // 5.14.6.8.1.1
+                    // The device MUST NOT complete the I/O request until the buffer is
+                    // totally consumed.
+                    desc_chain_clone
+                        .memory()
+                        .write_obj(response_cloned, desc_response_cloned.addr())
+                        .map_err(|_| Error::DescriptorWriteFailed).unwrap();
+
+                    let len = desc_response_cloned.len();
+                    if vring_cloned.add_used(desc_chain_clone.head_index(), len).is_err() {
+                        error!("Couldn't return used descriptors to the ring");
+                    }
+                    vring_cloned
+                        .signal_used_queue()
+                        .map_err(|_| Error::SendNotificationFailed).unwrap();
+                });
             }
         }
-        // Send notification once all the requests are processed
-        debug!("Sending processed tx notification");
-        vring
-            .signal_used_queue()
-            .map_err(|_| Error::SendNotificationFailed)?;
-        debug!("Process tx queue finished");
         Ok(false)
     }
 

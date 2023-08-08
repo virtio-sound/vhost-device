@@ -27,13 +27,18 @@ use std::{
 use log::debug;
 use pipewire as pw;
 use pw::spa::param::ParamType;
+use std::mem::size_of;
+
 use pw::spa::sys::{
     spa_audio_info_raw, spa_callbacks, spa_format_audio_raw_build, spa_pod, spa_pod_builder,
     spa_pod_builder_state, spa_ringbuffer, spa_ringbuffer_get_read_index, spa_ringbuffer_read_data,
-    spa_ringbuffer_read_update, SPA_PARAM_EnumFormat, SPA_AUDIO_CHANNEL_FL, SPA_AUDIO_CHANNEL_FR,
+    spa_ringbuffer_read_update, SPA_PARAM_EnumFormat, SPA_AUDIO_CHANNEL_MONO, SPA_AUDIO_CHANNEL_FL, SPA_AUDIO_CHANNEL_FR,
     SPA_AUDIO_FORMAT_S16, SPA_AUDIO_FORMAT_S32, SPA_AUDIO_FORMAT_S8, SPA_AUDIO_FORMAT_U16,
-    SPA_AUDIO_FORMAT_U32, SPA_AUDIO_FORMAT_U8, SPA_AUDIO_FORMAT_UNKNOWN,
+    SPA_AUDIO_FORMAT_U32, SPA_AUDIO_FORMAT_U8, SPA_AUDIO_FORMAT_UNKNOWN, SPA_AUDIO_CHANNEL_UNKNOWN
 };
+use pw::spa::sys::{spa_ringbuffer_write_update, spa_ringbuffer_write_data, spa_ringbuffer_get_write_index};
+
+
 use pw::stream::ListenerBuilderT;
 use pw::sys::{
     pw_buffer, pw_loop, pw_thread_loop, pw_thread_loop_get_loop, pw_thread_loop_lock,
@@ -128,6 +133,10 @@ pub struct PwBackend {
     pub stream_states: RwLock<Vec<u32>>,
     pub stream_hash: RwLock<HashMap<u32, pw::stream::Stream<i32>>>,
     pub stream_listener: RwLock<HashMap<u32, pw::stream::StreamListener<i32>>>,
+    // this is per stream
+    // Arc here may be wrong
+    pub stream_spa_ringbuffer: Arc<RwLock<Vec<spa_ringbuffer>>>,
+    pub stream_buffers: Arc<RwLock<Vec<Vec<u8>>>>
 }
 
 impl PwBackend {
@@ -165,6 +174,15 @@ impl PwBackend {
 
         let streams_param = vec![PCMParams::default(); NR_STREAMS];
         let streams_states = vec![0; NR_STREAMS];
+        let stream_spa_ringbuffer = vec![spa_ringbuffer {
+            readindex : 0 ,
+            writeindex : 0
+             }; NR_STREAMS];
+        // If the device has an intermediate buffer,
+        // its size MUST be no less than
+        // the specified buffer_bytes value.
+        let buff = vec![0 as u8; RINGBUFFER_SIZE as usize];
+        let streams_buffers = vec![buff; NR_STREAMS];
 
         Self {
             thread_loop,
@@ -174,6 +192,8 @@ impl PwBackend {
             stream_states: RwLock::new(streams_states),
             stream_hash: RwLock::new(HashMap::with_capacity(NR_STREAMS)),
             stream_listener: RwLock::new(HashMap::with_capacity(NR_STREAMS)),
+            stream_spa_ringbuffer: Arc::new(RwLock::new(stream_spa_ringbuffer)),
+            stream_buffers : Arc::new(RwLock::new(streams_buffers))
         }
     }
 }
@@ -188,9 +208,65 @@ impl AudioBackend for PwBackend {
         }
     }
 
-    fn write(&self, stream_id: u32) -> Result<()> {
-        println!("pipewire backend, writting to stream: {}", stream_id);
-        Ok(())
+    fn write(&self, stream_id: u32, req: &mut [u8]) -> Result<u32> {
+        self.thread_loop.lock();
+        let mut stream_spa_ringbuffer = self.stream_spa_ringbuffer.write().unwrap();
+        let ring = stream_spa_ringbuffer.get_mut(stream_id as usize).unwrap();
+
+        let mut stream_buffers = self.stream_buffers.write().unwrap();
+        let buffer = stream_buffers.get_mut(stream_id as usize).unwrap();
+
+        let mut index: u32 = 0;
+
+        let mut len : u32 = 0;
+
+        let stream_hash = self.stream_hash.read().unwrap();
+
+        if let Some(stream) = stream_hash.get(&stream_id) {
+            if stream.state() != pw::stream::StreamState::Streaming {
+                self.thread_loop.unlock();
+            } else {
+                let filled = unsafe {
+                    spa_ringbuffer_get_write_index(ring, &mut index)
+                };
+                let avail = RINGBUFFER_SIZE - filled as u32;
+
+                len = req.len() as u32;
+
+                if len > avail  {
+                     len = avail;
+                }
+
+                if filled < 0 {
+                    println!("underrun write: {} filled: {}", index, filled);
+                } else {
+                    if filled as u32 + len > RINGBUFFER_SIZE {
+                        println!("overrun write: {} filled:{} + size:{} > max:{}",
+                        index, filled, len, RINGBUFFER_SIZE);
+                    }
+                }
+
+                let raw_buffer =  buffer.as_mut_ptr() as *mut c_void;
+                let raw_req = req.as_mut_ptr() as *mut c_void;
+
+                unsafe {
+                    spa_ringbuffer_write_data(ring, raw_buffer,
+                        RINGBUFFER_SIZE, index & RINGBUFFER_MASK, raw_req, len as u32);
+                }
+
+                index += len as u32;
+                unsafe {
+                    spa_ringbuffer_write_update(ring, index);
+                }
+
+                self.thread_loop.unlock();
+            }
+        } else {
+            return Err(Error::StreamWithIdNotFound(stream_id));
+        };
+
+        //println!("pipewire backend, writting to stream: {}", stream_id);
+         Ok(len)
     }
 
     fn read(&self, _stream_id: u32) -> Result<()> {
@@ -207,6 +283,13 @@ impl AudioBackend for PwBackend {
         let mut stream_params = self.stream_params.write().unwrap();
         let mut stream_states = self.stream_states.write().unwrap();
         stream_params[stream_id as usize] = params;
+
+        // TODO: If the device has an intermediate buffer,
+        // its size MUST be no less than the specified buffer_bytes value.
+        // if u32::from(params.buffer_bytes) > RINGBUFFER_SIZE {
+        //     println!("something wrong!");
+        // }
+
         // state {SET_PARAM} -> {SET_PARAM}
         // state {PREPARE} -> {PREPARE}
         if stream_states[stream_id as usize] == 0 {
@@ -223,7 +306,12 @@ impl AudioBackend for PwBackend {
         let mut stream_listener = self.stream_listener.write().unwrap();
         self.thread_loop.lock();
         let stream_params = self.stream_params.read().unwrap();
+        let stream_buffers = self.stream_buffers.read().unwrap();
+
         let params = stream_params[stream_id as usize].clone();
+
+        let ring_cloned = self.stream_spa_ringbuffer.clone();
+        let buffers_cloned = stream_buffers.clone();
 
         let mut buff = [0; 1024];
         let p_buff = &mut buff as *mut i32 as *mut c_void;
@@ -243,11 +331,20 @@ impl AudioBackend for PwBackend {
             },
         };
 
-        let mut pos: [u32; 64] = [0; 64];
+        let mut pos: [u32; 64] = [SPA_AUDIO_CHANNEL_UNKNOWN; 64];
 
-        //todo map position to chmap
-        pos[0] = SPA_AUDIO_CHANNEL_FL;
-        pos[1] = SPA_AUDIO_CHANNEL_FR;
+        match params.channels {
+            2 => {
+                pos[0] = SPA_AUDIO_CHANNEL_FL;
+                pos[1] = SPA_AUDIO_CHANNEL_FR;
+            }
+            1 => {
+                pos[0] = SPA_AUDIO_CHANNEL_MONO;
+            }
+            _ => {
+                return Err(Error::ChannelNotSupported);
+            }
+        }
         let mut info = spa_audio_info_raw {
             format: match params.format {
                 VIRTIO_SND_PCM_FMT_S8 => SPA_AUDIO_FORMAT_S8,
@@ -317,35 +414,39 @@ impl AudioBackend for PwBackend {
                             return;
                         }
 
-                        let frame_size = info.channels;
+                        // to calculate as sizeof(int16_t) * NR_CHANNELS
+                        let frame_size = info.channels * size_of::<u16>() as u32;
                         let req = (*b).requested * (frame_size as u64);
                         let mut n_bytes = cmp::min(req as u32, (*datas).maxsize);
 
-                        let buffer: Vec<u8> = vec![0; RINGBUFFER_SIZE as usize];
-                        let buffer_ptr = buffer.as_ptr() as *const c_void;
+                        let buffers = buffers_cloned.get(stream_id as usize).unwrap();
+                        let buffer_ptr = buffers.as_ptr() as *const c_void;
 
-                        //use spa_ringbuffer functions
                         let mut index: u32 = 0;
-                        let mut ring = spa_ringbuffer {
-                            readindex: 0,
-                            writeindex: 0,
-                        };
-                        //get no of available bytes to read data from buffer
-                        let avail = spa_ringbuffer_get_read_index(&mut ring, &mut index);
-                        if avail < n_bytes as i32 {
-                            n_bytes = avail.try_into().unwrap();
-                        }
-                        spa_ringbuffer_read_data(
-                            &mut ring,
-                            buffer_ptr,
-                            RINGBUFFER_SIZE,
-                            index & RINGBUFFER_MASK,
-                            p,
-                            n_bytes,
-                        );
-                        index += n_bytes;
-                        spa_ringbuffer_read_update(&mut ring, index);
+                        let mut ring = ring_cloned.write().unwrap();
+                        let ring_mut = ring.get_mut(stream_id as usize).unwrap();
 
+                        //get no of available bytes to read data from buffer
+                        let avail = spa_ringbuffer_get_read_index(ring_mut, &mut index);
+
+                        if avail <= 0 {
+                            // TODO: to add silent by using
+                            // audio_pcm_info_clear_buf(&vo->hw.info, p, n_bytes / v->frame_size);
+                        } else {
+                            if avail < n_bytes as i32 {
+                                n_bytes = avail.try_into().unwrap();
+                            }
+                            spa_ringbuffer_read_data(
+                                ring_mut,
+                                buffer_ptr,
+                                RINGBUFFER_SIZE,
+                                index & RINGBUFFER_MASK,
+                                p,
+                                n_bytes,
+                            );
+                            index += n_bytes;
+                            spa_ringbuffer_read_update(ring_mut, index);
+                        }
                         (*(*datas).chunk).offset = 0;
                         (*(*datas).chunk).stride = frame_size as i32;
                         (*(*datas).chunk).size = n_bytes;

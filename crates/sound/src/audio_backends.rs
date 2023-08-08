@@ -16,7 +16,8 @@ use crate::{Error, Result};
 pub trait AudioBackend {
     fn get_stream_state(&self, _stream_id: u32) -> Result<u32>;
 
-    fn write(&self, stream_id: u32) -> Result<()>;
+    // TODO: to remove mut
+    fn write(&self, stream_id: u32, req: &mut [u8]) -> Result<u32>;
 
     fn read(&self, stream_id: u32) -> Result<()>;
 
