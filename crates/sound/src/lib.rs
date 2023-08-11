@@ -42,6 +42,8 @@ pub enum Error {
     SendNotificationFailed,
     #[error("Stream with id {0} not found")]
     StreamWithIdNotFound(u32),
+    #[error("Stream Listener with id {0} not found")]
+    StreamListenerWithIdNotFound(u32),
     #[error("Invalid descriptor count {0}")]
     UnexpectedDescriptorCount(usize),
     #[error("Invalid descriptor size, expected: {0}, found: {1}")]

@@ -7,12 +7,12 @@ use crate::virtio_sound::{
     VIRTIO_SND_D_INPUT, VIRTIO_SND_D_OUTPUT, VIRTIO_SND_PCM_FMT_S16, VIRTIO_SND_PCM_FMT_S32,
     VIRTIO_SND_PCM_FMT_S8, VIRTIO_SND_PCM_FMT_U16, VIRTIO_SND_PCM_FMT_U32, VIRTIO_SND_PCM_FMT_U8,
     VIRTIO_SND_PCM_RATE_32000, VIRTIO_SND_PCM_RATE_44100, VIRTIO_SND_PCM_RATE_48000,
-    VIRTIO_SND_PCM_RATE_64000, VIRTIO_SND_R_PCM_PREPARE, VIRTIO_SND_R_PCM_SET_PARAMS,
+    VIRTIO_SND_PCM_RATE_64000, VIRTIO_SND_R_PCM_PREPARE, VIRTIO_SND_R_PCM_RELEASE,
+    VIRTIO_SND_R_PCM_SET_PARAMS, VIRTIO_SND_R_PCM_START, VIRTIO_SND_R_PCM_STOP,
 };
 use crate::Error;
 use crate::PCMParams;
 use crate::Result;
-use log::error;
 use std::{
     cmp,
     collections::HashMap,
@@ -24,6 +24,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 
+use log::debug;
 use pipewire as pw;
 use pw::spa::param::ParamType;
 use pw::spa::sys::{
@@ -180,7 +181,6 @@ impl PwBackend {
 impl AudioBackend for PwBackend {
     fn get_stream_state(&self, stream_id: u32) -> Result<u32> {
         let stream_states = self.stream_states.read().unwrap();
-        dbg!("stream states: {}", stream_states.clone());
         if let Some(state) = stream_states.get(stream_id as usize) {
             Ok(*state)
         } else {
@@ -217,7 +217,7 @@ impl AudioBackend for PwBackend {
     }
 
     fn prepare(&self, stream_id: u32) -> Result<()> {
-        println!("pipewire backend, prepare function");
+        debug!("pipewire backend, prepare function");
         let mut stream_states = self.stream_states.write().unwrap();
         let mut stream_hash = self.stream_hash.write().unwrap();
         let mut stream_listener = self.stream_listener.write().unwrap();
@@ -282,7 +282,9 @@ impl AudioBackend for PwBackend {
         )
         .expect("could not create new stream");
 
-        if stream_states[stream_id as usize] == VIRTIO_SND_R_PCM_SET_PARAMS {
+        if stream_states[stream_id as usize] == VIRTIO_SND_R_PCM_SET_PARAMS
+            || stream_states[stream_id as usize] == VIRTIO_SND_R_PCM_RELEASE
+        {
             let listener_stream = stream
                 .add_local_listener()
                 .state_changed(move |old, new| {
@@ -367,6 +369,7 @@ impl AudioBackend for PwBackend {
                     Some(pipewire::constants::ID_ANY),
                     pw::stream::StreamFlags::RT_PROCESS
                         | pw::stream::StreamFlags::AUTOCONNECT
+                        | pw::stream::StreamFlags::INACTIVE
                         | pw::stream::StreamFlags::MAP_BUFFERS,
                     &mut [param],
                 )
@@ -391,28 +394,52 @@ impl AudioBackend for PwBackend {
     }
 
     fn release(&self, stream_id: u32) -> Result<()> {
-        println!("pipewire backend, release function");
+        debug!("pipewire backend, release function");
         self.thread_loop.lock();
         let mut stream_states = self.stream_states.write().unwrap();
-        let stream_hash = self.stream_hash.read().unwrap();
-        let stream_listener = self.stream_listener.read().unwrap();
+        let mut stream_hash = self.stream_hash.write().unwrap();
+        let mut stream_listener = self.stream_listener.write().unwrap();
 
         if let Some(stream) = stream_hash.get(&stream_id) {
             stream.disconnect().expect("could not disconnect stream");
         } else {
-            error!("stream not found for the given stream_id");
+            return Err(Error::StreamWithIdNotFound(stream_id));
         };
-        if let Some(stream_lis) = stream_listener.get(&stream_id) {
-            //unregister stream
-            std::mem::drop(stream_lis);
-        } else {
-            error!("stream listener not found for the given stream_id");
-        };
+        stream_hash.remove(&stream_id);
+        stream_listener.remove(&stream_id);
 
-        if stream_states[stream_id as usize] == VIRTIO_SND_R_PCM_PREPARE {
-            stream_states[stream_id as usize] = VIRTIO_SND_R_PCM_SET_PARAMS;
-        }
+        stream_states[stream_id as usize] = VIRTIO_SND_R_PCM_RELEASE;
         self.thread_loop.unlock();
         Ok(())
+    }
+
+    fn start(&self, stream_id: u32) -> Result<()> {
+        debug!("pipewire start");
+        self.thread_loop.lock();
+        let mut stream_states = self.stream_states.write().unwrap();
+        let stream_hash = self.stream_hash.read().unwrap();
+        if let Some(stream) = stream_hash.get(&stream_id) {
+            stream.set_active(true).expect("could not start stream");
+            stream_states[stream_id as usize] = VIRTIO_SND_R_PCM_START;
+            self.thread_loop.unlock();
+            Ok(())
+        } else {
+            Err(Error::StreamWithIdNotFound(stream_id))
+        }
+    }
+
+    fn stop(&self, stream_id: u32) -> Result<()> {
+        debug!("pipewire stop");
+        self.thread_loop.lock();
+        let mut stream_states = self.stream_states.write().unwrap();
+        let stream_hash = self.stream_hash.read().unwrap();
+        if let Some(stream) = stream_hash.get(&stream_id) {
+            stream.set_active(false).expect("could not stop stream");
+            stream_states[stream_id as usize] = VIRTIO_SND_R_PCM_STOP;
+            self.thread_loop.unlock();
+            Ok(())
+        } else {
+            Err(Error::StreamWithIdNotFound(stream_id))
+        }
     }
 }
