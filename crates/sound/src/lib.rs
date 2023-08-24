@@ -11,9 +11,11 @@ use log::{info, warn};
 use thiserror::Error as ThisError;
 use vhost::{vhost_user, vhost_user::Listener};
 use vhost_user_backend::VhostUserDaemon;
-use vm_memory::{GuestMemoryAtomic, GuestMemoryMmap, Le32, VolatileSlice};
+use vm_memory::{GuestMemoryAtomic, GuestMemoryMmap, GuestMemoryLoadGuard, Le32, VolatileSlice};
 
 use crate::vhu_sound::VhostUserSoundBackend;
+use vhost_user_backend::VringRwLock;
+use virtio_queue::DescriptorChain;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -75,6 +77,15 @@ pub struct PCMParams {
     pub format: u8,
     pub rate: u8,
     pub direction: u8,
+}
+
+pub type SoundDescriptorChain = DescriptorChain<GuestMemoryLoadGuard<GuestMemoryMmap<()>>>;
+
+pub struct Request{
+    pub buf: Vec<u8>, // this is period_bytes size
+    pub desc_chain: SoundDescriptorChain,
+    pub descriptor: virtio_queue::Descriptor,
+    pub vring: VringRwLock,
 }
 
 #[derive(Debug, Clone)]

@@ -136,7 +136,8 @@ pub struct PwBackend {
     // this is per stream
     // Arc here may be wrong
     pub stream_spa_ringbuffer: Arc<RwLock<Vec<spa_ringbuffer>>>,
-    pub stream_buffers: Arc<RwLock<Vec<Vec<u8>>>>
+    pub stream_buffers: Arc<RwLock<Vec<Vec<u8>>>>,
+    pub highwater_mark: Arc<RwLock<u32>>,
 }
 
 impl PwBackend {
@@ -193,7 +194,8 @@ impl PwBackend {
             stream_hash: RwLock::new(HashMap::with_capacity(NR_STREAMS)),
             stream_listener: RwLock::new(HashMap::with_capacity(NR_STREAMS)),
             stream_spa_ringbuffer: Arc::new(RwLock::new(stream_spa_ringbuffer)),
-            stream_buffers : Arc::new(RwLock::new(streams_buffers))
+            stream_buffers : Arc::new(RwLock::new(streams_buffers)),
+            highwater_mark : Arc::new(RwLock::new(0))
         }
     }
 }
@@ -229,7 +231,9 @@ impl AudioBackend for PwBackend {
                 let filled = unsafe {
                     spa_ringbuffer_get_write_index(ring, &mut index)
                 };
-                let avail = RINGBUFFER_SIZE - filled as u32;
+
+                let highwater_mark = *self.highwater_mark.read().unwrap();
+                let avail = highwater_mark - filled as u32;
 
                 len = req.len() as u32;
 
@@ -282,7 +286,7 @@ impl AudioBackend for PwBackend {
     fn set_param(&self, stream_id: u32, params: PCMParams) -> Result<()> {
         let mut stream_params = self.stream_params.write().unwrap();
         let mut stream_states = self.stream_states.write().unwrap();
-        stream_params[stream_id as usize] = params;
+        stream_params[stream_id as usize] = params.clone();
 
         // TODO: If the device has an intermediate buffer,
         // its size MUST be no less than the specified buffer_bytes value.
@@ -306,12 +310,12 @@ impl AudioBackend for PwBackend {
         let mut stream_listener = self.stream_listener.write().unwrap();
         self.thread_loop.lock();
         let stream_params = self.stream_params.read().unwrap();
-        let stream_buffers = self.stream_buffers.read().unwrap();
 
         let params = stream_params[stream_id as usize].clone();
 
         let ring_cloned = self.stream_spa_ringbuffer.clone();
-        let buffers_cloned = stream_buffers.clone();
+
+        let buffers_cloned = self.stream_buffers.clone();
 
         let mut buff = [0; 1024];
         let p_buff = &mut buff as *mut i32 as *mut c_void;
@@ -369,15 +373,28 @@ impl AudioBackend for PwBackend {
         let param: *mut spa_pod =
             unsafe { spa_format_audio_raw_build(&mut b, SPA_PARAM_EnumFormat, &mut info) };
 
+        // TODO: to check this 10000??
+        let buf_samples: u64 = 10000 * 4 * (info.rate as u64) * 3 / 4 / 1000000;
+
+        let val = format!("{} / {}", buf_samples, info.rate);
+
         let mut stream = pw::stream::Stream::<i32>::new(
             &self.core,
             "audio-output",
             properties! {
                 *pw::keys::MEDIA_TYPE => "Audio",
                 *pw::keys::MEDIA_CATEGORY => "Playback",
+                *pw::keys::NODE_LATENCY => val,
             },
         )
         .expect("could not create new stream");
+        //     v->highwater_mark = MIN(RINGBUFFER_SIZE,
+                //    (ppdo->has_latency ? ppdo->latency : 46440)
+                //    * (uint64_t)v->info.rate / 1000000 * v->frame_size);
+                //
+        let frame_size = info.channels as u32 * size_of::<u16>() as u32;
+        let mut highwater_mark = self.highwater_mark.write().unwrap();
+        *highwater_mark = cmp::min(RINGBUFFER_SIZE as u32, (46440 * info.rate as u32 / 1000000 * frame_size) as u32);
 
         if stream_states[stream_id as usize] == VIRTIO_SND_R_PCM_SET_PARAMS
             || stream_states[stream_id as usize] == VIRTIO_SND_R_PCM_RELEASE
@@ -415,11 +432,18 @@ impl AudioBackend for PwBackend {
                         }
 
                         // to calculate as sizeof(int16_t) * NR_CHANNELS
-                        let frame_size = info.channels * size_of::<u16>() as u32;
+                        let frame_size = info.channels as u32 * size_of::<u16>() as u32;
                         let req = (*b).requested * (frame_size as u64);
+
+                        if req == 0{
+                            panic!("req = 0");
+                        }
+
                         let mut n_bytes = cmp::min(req as u32, (*datas).maxsize);
 
-                        let buffers = buffers_cloned.get(stream_id as usize).unwrap();
+                        let buffers_queue = buffers_cloned.read().unwrap();
+
+                        let buffers = buffers_queue.get(stream_id as usize).unwrap();
                         let buffer_ptr = buffers.as_ptr() as *const c_void;
 
                         let mut index: u32 = 0;
@@ -432,6 +456,7 @@ impl AudioBackend for PwBackend {
                         if avail <= 0 {
                             // TODO: to add silent by using
                             // audio_pcm_info_clear_buf(&vo->hw.info, p, n_bytes / v->frame_size);
+                            // panic!("avail < 0");
                         } else {
                             if avail < n_bytes as i32 {
                                 n_bytes = avail.try_into().unwrap();
@@ -447,9 +472,11 @@ impl AudioBackend for PwBackend {
                             index += n_bytes;
                             spa_ringbuffer_read_update(ring_mut, index);
                         }
+
                         (*(*datas).chunk).offset = 0;
                         (*(*datas).chunk).stride = frame_size as i32;
                         (*(*datas).chunk).size = n_bytes;
+
                         stream.queue_raw_buffer(b);
                     }
                 })

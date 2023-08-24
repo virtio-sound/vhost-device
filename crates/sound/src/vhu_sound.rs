@@ -3,8 +3,9 @@
 use std::mem::size_of;
 use std::sync::Arc;
 use std::sync::RwLock;
+use std::collections::VecDeque;
 use std::{io::Result as IoResult, u16, u32, u64, u8};
-use std::thread;
+use std::{thread, time};
 
 use log::{debug, error};
 use vhost::vhost_user::message::{VhostUserProtocolFeatures, VhostUserVirtioFeatures};
@@ -25,6 +26,8 @@ use vmm_sys_util::{
 use crate::audio_backends::{alloc_audio_backend, AudioBackend};
 use crate::virtio_sound::*;
 use crate::PCMParams;
+use crate::Request;
+
 use crate::{Error, Result, SoundConfig};
 use vm_memory::{Le32, Le64};
 
@@ -112,6 +115,7 @@ impl VhostUserSoundThread {
         device_event: u16,
         vrings: &[VringRwLock],
         stream_info: &[StreamInfo],
+        stream_requests: &Arc<RwLock<VecDeque<Request>>>,
     ) -> IoResult<bool> {
         let vring = &vrings[device_event as usize];
         let queue_idx = self.queue_indexes[device_event as usize];
@@ -150,14 +154,14 @@ impl VhostUserSoundThread {
                     // new requests on the queue.
                     loop {
                         vring.disable_notification().unwrap();
-                        self.process_tx(vring)?;
+                        self.process_tx(vring, stream_requests)?;
                         if !vring.enable_notification().unwrap() {
                             break;
                         }
                     }
                 } else {
                     // Without EVENT_IDX, a single call is enough.
-                    self.process_tx(vring)?;
+                    self.process_tx(vring, stream_requests)?;
                 }
             }
             RX_QUEUE_IDX => {
@@ -496,7 +500,7 @@ impl VhostUserSoundThread {
         Ok(false)
     }
 
-    fn process_tx(&self, vring: &VringRwLock) -> Result<bool> {
+    fn process_tx(&self, vring: &VringRwLock, stream_request: &Arc<RwLock<VecDeque<Request>>>) -> Result<bool> {
         let requests: Vec<SndDescriptorChain> = vring
             .get_mut()
             .get_queue_mut()
@@ -591,51 +595,14 @@ impl VhostUserSoundThread {
                     all_bufs.extend(buf);
                 }
 
-                let mut all_bufs_cloned = all_bufs.clone();
-                let audio_backend_cloned = audio_backend.clone();
-                let vring_cloned = vring.clone();
-                let desc_response_cloned = desc_response.clone();
-                let desc_chain_clone = desc_chain.clone();
-                let mut response_cloned = response.clone();
+                let req = Request {
+                    buf : all_bufs,
+                    desc_chain : desc_chain.clone(),
+                    descriptor : desc_response.clone(),
+                    vring : vring.clone()
+                };
 
-                // TODO: spawn a thread to async respond to guest
-                thread::spawn(move|| {
-                    let mut start : u32 = 0;
-                    'write: loop {
-                        match audio_backend_cloned.write(stream_id, &mut all_bufs_cloned[start as usize..]) {
-                            Ok(len) => {
-                                start += len;
-                                if start == all_bufs.len() as u32 {
-                                    break 'write;
-                                }
-                                //println!("start: {} {}", start, all_bufs.len());
-                            }
-                            Err(_) => {
-                                response_cloned = VirtioSoundPcmStatus {
-                                    status: VIRTIO_SND_S_IO_ERR.into(),
-                                    latency_bytes: 0.into(),
-                                };
-                                debug!("IO error during write()");
-                                break 'write;
-                            }
-                        };
-                    };
-                    // 5.14.6.8.1.1
-                    // The device MUST NOT complete the I/O request until the buffer is
-                    // totally consumed.
-                    desc_chain_clone
-                        .memory()
-                        .write_obj(response_cloned, desc_response_cloned.addr())
-                        .map_err(|_| Error::DescriptorWriteFailed).unwrap();
-
-                    let len = desc_response_cloned.len();
-                    if vring_cloned.add_used(desc_chain_clone.head_index(), len).is_err() {
-                        error!("Couldn't return used descriptors to the ring");
-                    }
-                    vring_cloned
-                        .signal_used_queue()
-                        .map_err(|_| Error::SendNotificationFailed).unwrap();
-                });
+                stream_request.write().unwrap().push_back(req);
             }
         }
         Ok(false)
@@ -651,6 +618,7 @@ pub struct VhostUserSoundBackend {
     virtio_cfg: VirtioSoundConfig,
     exit_event: EventFd,
     streams_info: Vec<StreamInfo>,
+    streams_request: Arc<RwLock<VecDeque<Request>>>,
 }
 
 type SndDescriptorChain = DescriptorChain<GuestMemoryLoadGuard<GuestMemoryMmap<()>>>;
@@ -688,9 +656,73 @@ impl VhostUserSoundBackend {
 
         let mut streams = Vec::<StreamInfo>::with_capacity(NR_STREAMS);
 
+        let stream_requests = Arc::new(RwLock::new(VecDeque::<Request>::new()));
+        let stream_requests_clone = stream_requests.clone();
+
         let stream_out_info = StreamInfo::output();
         // TODO: to add a input stream
         streams.push(stream_out_info);
+
+        let audio_backend_cloned = audio_backend_arc.clone();
+        thread::spawn(move|| {
+            loop {
+                while stream_requests_clone.write().unwrap().len() != 0 {
+                    let req = stream_requests_clone.write().unwrap().pop_front().unwrap();
+                    let mut buf = req.buf;
+                    let desc_chain = req.desc_chain;
+                    let vring = req.vring;
+                    let descriptor = req.descriptor;
+                    let mut response = VirtioSoundPcmStatus {
+                        status: VIRTIO_SND_S_OK.into(),
+                        latency_bytes: 0.into(),
+                    };
+                    // TODO: to get stream_id
+                    let mut start : u32 = 0;
+                    'write: loop {
+                        match audio_backend_cloned.write(0, &mut buf[start as usize..]) {
+                            Ok(len) => {
+                                start += len;
+                                if start == buf.len() as u32 {
+                                    break 'write;
+                                }
+                            }
+                            Err(_) => {
+                                response = VirtioSoundPcmStatus {
+                                    status: VIRTIO_SND_S_IO_ERR.into(),
+                                    latency_bytes: 0.into(),
+                                };
+                                debug!("IO error during write()");
+                                break 'write;
+                            }
+                        };
+                        // NOTE: if the sleep is longer, this gives time to
+                        // the audio backend to process the current data. The audio backend
+                        // process data slower than the guest produced
+                        // we can observe that the ring buffer is full but
+                        // the audiobackend is still processing data
+                        // if it is too short, this can full the ring buffer
+                        thread::sleep(time::Duration::from_millis(40));
+                    };
+                    // to notify guest after request has been consumed
+                    desc_chain
+                        .memory()
+                        .write_obj(response, descriptor.addr())
+                        .map_err(|_| Error::DescriptorWriteFailed).unwrap();
+
+                    let len = descriptor.len();
+                    if vring.add_used(desc_chain.head_index(), len).is_err() {
+                        error!("Couldn't return used descriptors to the ring");
+                    }
+                    vring
+                        .signal_used_queue()
+                        .map_err(|_| Error::SendNotificationFailed).unwrap();
+               };
+               // wake up at 25hz -> 1000 ms / 25 = 40 ms
+               // if 100hz -> 1000 ms / 100  = 10ms
+               thread::sleep(time::Duration::from_millis(40));
+            }
+        });
+
 
         Ok(Self {
             threads,
@@ -700,6 +732,7 @@ impl VhostUserSoundBackend {
                 chmaps: 0.into(),
             },
             streams_info: streams,
+            streams_request: stream_requests.clone(),
             exit_event: EventFd::new(EFD_NONBLOCK).map_err(Error::EventFdCreate)?,
         })
     }
@@ -759,6 +792,7 @@ impl VhostUserBackend<VringRwLock, ()> for VhostUserSoundBackend {
             device_event,
             vrings,
             &self.streams_info,
+            &self.streams_request
         )
     }
 
