@@ -397,6 +397,10 @@ impl VhostUserSoundThread {
 
         let mut stream_ids = BTreeSet::default();
 
+        // temporary workaround for processing the buffers speed
+        // see https://github.com/virtio-sound/vhost-device/issues/25
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
         for desc_chain in requests {
             let mut state = TxState::Ready;
             let mut buffers = vec![];
