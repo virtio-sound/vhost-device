@@ -3,7 +3,6 @@
 
 use std::{
     collections::HashMap,
-    convert::TryInto,
     mem::size_of,
     ptr,
     sync::{Arc, RwLock},
@@ -318,42 +317,56 @@ impl AudioBackend for PwBackend {
                         let frame_size = info.channels * size_of::<i16>() as u32;
                         let data = &mut datas[0];
                         let n_bytes = if let Some(slice) = data.data() {
-                            let mut n_bytes = slice.len();
                             let mut streams = streams.write().unwrap();
                             let streams = streams
                                 .get_mut(stream_id as usize)
                                 .expect("Stream does not exist");
-                            let Some(buffer) = streams.buffers.front_mut() else {
-                                return;
-                            };
 
-                            let mut start = buffer.pos;
+                            let slice_len = slice.len();
+                            let period_bytes = streams.params.period_bytes.to_native() as usize;
+                            let mut total_read = 0;
 
-                            let avail = (buffer.data_descriptor.len() - start as u32) as i32;
+                            while total_read < period_bytes {
+                                let Some(buffer) = streams.buffers.front_mut() else {
+                                    debug!("no more buffers!");
+                                    break;
+                                };
 
-                            if avail < n_bytes as i32 {
-                                n_bytes = avail.try_into().unwrap();
-                            }
-                            let p = &mut slice[0..n_bytes];
-                            if avail <= 0 {
-                                // pad with silence
-                                unsafe {
-                                    ptr::write_bytes(p.as_mut_ptr(), 0, n_bytes);
+                                let mut to_read = period_bytes - total_read;
+                                let buf_len =
+                                    (buffer.data_descriptor.len() - buffer.pos as u32) as usize;
+                                if to_read > buf_len {
+                                    to_read = buf_len;
                                 }
-                            } else {
-                                // consume() always reads (buffer.data_descriptor.len() -
-                                // buffer.pos) bytes
+
+                                debug!(
+                                    "to_read={to_read}, buf_len={buf_len}, buf_pos={}",
+                                    buffer.pos
+                                );
+
+                                let p = &mut slice[total_read..total_read + to_read as usize];
                                 buffer.consume(p).expect("failed to read buffer from guest");
 
-                                start += n_bytes;
+                                total_read += to_read;
 
-                                buffer.pos = start;
-
-                                if start >= buffer.data_descriptor.len() as usize {
+                                if to_read == buf_len {
                                     streams.buffers.pop_front();
+                                } else {
+                                    buffer.pos += to_read;
                                 }
                             }
-                            n_bytes
+
+                            debug!("period_bytes={period_bytes}, total_read={total_read}, slice_len={slice_len}");
+
+                            if total_read < period_bytes {
+                                let p = &mut slice[total_read..period_bytes];
+                                // pad with silence
+                                unsafe {
+                                    ptr::write_bytes(p.as_mut_ptr(), 0, slice_len - total_read);
+                                }
+                            }
+
+                            total_read
                         } else {
                             0
                         };
