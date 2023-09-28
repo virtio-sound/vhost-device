@@ -176,7 +176,7 @@ pub struct Stream {
     pub channels_min: u8,
     pub channels_max: u8,
     pub state: PCMState,
-    pub buffers: VecDeque<Buffer>,
+    pub buffers: VecDeque<Request>,
 }
 
 impl Default for Stream {
@@ -235,14 +235,15 @@ impl Default for PcmParams {
     }
 }
 
-pub struct Buffer {
-    // TODO: to make private and add len usize
-    pub data_descriptor: virtio_queue::Descriptor,
+pub struct Request {
+    pub len: usize,
     pub pos: usize,
     pub message: Arc<IOMessage>,
+    pos_curr_desc: usize,
+    idx_curr_desc: usize,
 }
 
-impl std::fmt::Debug for Buffer {
+impl std::fmt::Debug for Request {
     fn fmt(&self, fmt: &mut std::fmt::Formatter) -> std::fmt::Result {
         fmt.debug_struct(stringify!(Buffer))
             .field("pos", &self.pos)
@@ -251,33 +252,67 @@ impl std::fmt::Debug for Buffer {
     }
 }
 
-impl Buffer {
-    pub fn new(data_descriptor: virtio_queue::Descriptor, message: Arc<IOMessage>) -> Self {
+impl Request {
+    pub fn new(len: usize, message: Arc<IOMessage>) -> Self {
         Self {
+            len,
             pos: 0,
-            data_descriptor,
             message,
+            pos_curr_desc: 0,
+            // payload begins after the header descriptor
+            idx_curr_desc: 1,
         }
     }
 
-    pub fn consume(&self, buf: &mut [u8]) -> Result<u32> {
-        let addr = self.data_descriptor.addr();
-        let offset = self.pos as u64;
-        let len = self
-            .message
-            .desc_chain
-            .memory()
-            .read(
-                buf,
-                addr.checked_add(offset)
-                    .expect("invalid guest memory address"),
-            )
-            .map_err(|_| Error::DescriptorReadFailed)?;
-        Ok(len as u32)
+    pub fn consume(&mut self, buf: &mut [u8]) -> Result<u32> {
+        let mut count = buf.len();
+        let descriptors: Vec<_> = self.message.desc_chain.clone().collect();
+        let mut buf_pos = 0;
+
+        while count > 0 {
+            // payload finishes at index (descriptor.len() - 2)
+            if self.idx_curr_desc > descriptors.len() - 1 {
+                log::error!(
+                    "idx_desc: {} > len: {}!",
+                    self.idx_curr_desc,
+                    descriptors.len() - 1
+                );
+                break;
+            }
+            let avail = descriptors[self.idx_curr_desc].len() - self.pos_curr_desc as u32;
+            let mut end = buf.len() as u32;
+
+            if avail < (buf.len() - buf_pos) as u32 {
+                end = buf_pos as u32 + avail;
+            }
+
+            let len = self
+                .message
+                .desc_chain
+                .memory()
+                .read(
+                    &mut buf[buf_pos..end as usize],
+                    descriptors[self.idx_curr_desc]
+                        .addr()
+                        .checked_add(self.pos_curr_desc as u64)
+                        .ok_or(Error::DescriptorReadFailed)?,
+                )
+                .map_err(|_| Error::DescriptorReadFailed)?;
+
+            buf_pos += len;
+            self.pos_curr_desc += len;
+            count -= len;
+
+            if self.pos_curr_desc >= descriptors[self.idx_curr_desc].len() as usize {
+                self.idx_curr_desc += 1;
+                self.pos_curr_desc = 0;
+            }
+        }
+        Ok((buf.len() - count) as u32)
     }
 }
 
-impl Drop for Buffer {
+impl Drop for Request {
     fn drop(&mut self) {
         log::trace!("dropping buffer {:?}", self);
     }

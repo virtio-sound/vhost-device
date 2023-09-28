@@ -145,17 +145,18 @@ fn write_samples_direct(
         let Some(buffer) = stream.buffers.front_mut() else {
             return Ok(false);
         };
-        let mut buf = vec![0; buffer.data_descriptor.len() as usize];
-        let read_bytes = buffer
-            .consume(&mut buf)
-            .expect("failed to read buffer from guest");
+        let mut buf = vec![0; buffer.len];
+        let read_bytes = buffer.consume(&mut buf).unwrap_or_else(|_| {
+            log::error!("Failed to read from guest memory");
+            0
+        });
         let mut iter = buf[0..read_bytes as usize].iter().cloned();
         let frames = mmap.write(&mut iter);
         let written_bytes = pcm.frames_to_bytes(frames);
         if let Ok(written_bytes) = usize::try_from(written_bytes) {
             buffer.pos += written_bytes;
         }
-        if buffer.pos >= buffer.data_descriptor.len() as usize {
+        if buffer.pos >= buffer.len {
             stream.buffers.pop_front();
         }
     }
@@ -195,13 +196,14 @@ fn write_samples_io(
             let Some(buffer) = stream.buffers.front_mut() else {
                 return 0;
             };
-            let mut data = vec![0; buffer.data_descriptor.len() as usize];
+            let mut data = vec![0; buffer.len];
 
-            // consume() always reads (buffer.data_descriptor.len() -
-            // buffer.pos) bytes
-            let read_bytes = buffer
-                .consume(&mut data)
-                .expect("failed to read buffer from guest");
+            // consume() always reads buffer.len
+            let read_bytes = buffer.consume(&mut data).unwrap_or_else(|_| {
+                log::error!("Failed to read from guest memory");
+                0
+            });
+
             let mut iter = data[0..read_bytes as usize].iter().cloned();
 
             let mut written_bytes = 0;
@@ -210,7 +212,7 @@ fn write_samples_io(
                 written_bytes += 1;
             }
             buffer.pos += written_bytes as usize;
-            if buffer.pos >= buffer.data_descriptor.len() as usize {
+            if buffer.pos >= buffer.len {
                 stream.buffers.pop_front();
             }
             p.bytes_to_frames(written_bytes)

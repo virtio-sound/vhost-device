@@ -327,9 +327,7 @@ impl AudioBackend for PwBackend {
                                 return;
                             };
 
-                            let mut start = buffer.pos;
-
-                            let avail = (buffer.data_descriptor.len() - start as u32) as i32;
+                            let avail = (buffer.len as u32 - buffer.pos as u32) as i32;
 
                             if avail < n_bytes as i32 {
                                 n_bytes = avail.try_into().unwrap();
@@ -341,15 +339,15 @@ impl AudioBackend for PwBackend {
                                     ptr::write_bytes(p.as_mut_ptr(), 0, n_bytes);
                                 }
                             } else {
-                                // consume() always reads (buffer.data_descriptor.len() -
-                                // buffer.pos) bytes
-                                buffer.consume(p).expect("failed to read buffer from guest");
+                                // consume() always tries to read p.len() unless error
+                                let n_bytes = buffer.consume(p).unwrap_or_else(|_| {
+                                    log::error!("Failed to read from guest memory");
+                                    0
+                                });
 
-                                start += n_bytes;
+                                buffer.pos += n_bytes as usize;
 
-                                buffer.pos = start;
-
-                                if start >= buffer.data_descriptor.len() as usize {
+                                if buffer.pos >= buffer.len {
                                     streams.buffers.pop_front();
                                 }
                             }
