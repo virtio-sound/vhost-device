@@ -353,16 +353,17 @@ impl AlsaBackend {
                         );
                         continue;
                     };
-
-                    let start_result = streams.write().unwrap()[stream_id].state.start();
-                    if let Err(err) = start_result {
-                        log::error!("Stream {} start {}", stream_id, err);
-                    } else {
-                        let pcm = &pcms[stream_id];
-                        let lck = pcm.lock().unwrap();
-                        match lck.state() {
-                            State::Running => {}
-                            _ => lck.start()?,
+                    streams.write().unwrap()[stream_id].state.start();
+                    let pcm = &pcms[stream_id];
+                    let lck = pcm.lock().unwrap();
+                    if !matches!(lck.state(), State::Running) {
+                        // Fail gracefully if Start does not succeed.
+                        if let Err(err) = lck.start() {
+                            log::error!(
+                                "Could not start stream {}; ALSA returned: {}",
+                                stream_id,
+                                err
+                            );
                         }
                     }
                 }
@@ -376,10 +377,7 @@ impl AlsaBackend {
                         );
                         continue;
                     };
-                    let stop_result = streams.write().unwrap()[stream_id].state.stop();
-                    if let Err(err) = stop_result {
-                        log::error!("Stream {} stop {}", stream_id, err);
-                    }
+                    streams.write().unwrap()[stream_id].state.stop();
                 }
                 AlsaAction::Prepare(stream_id) => {
                     if stream_id >= streams_no {
@@ -391,15 +389,17 @@ impl AlsaBackend {
                         );
                         continue;
                     };
-                    let prepare_result = streams.write().unwrap()[stream_id].state.prepare();
-                    if let Err(err) = prepare_result {
-                        log::error!("Stream {} prepare {}", stream_id, err);
-                    } else {
-                        let pcm = &pcms[stream_id];
-                        let lck = pcm.lock().unwrap();
-                        match lck.state() {
-                            State::Running => {}
-                            _ => lck.prepare()?,
+                    streams.write().unwrap()[stream_id].state.prepare();
+                    let pcm = &pcms[stream_id];
+                    let lck = pcm.lock().unwrap();
+                    if !matches!(lck.state(), State::Running) {
+                        // Fail gracefully if Prepare does not succeed.
+                        if let Err(err) = lck.prepare() {
+                            log::error!(
+                                "Could not prepare stream {}; ALSA returned: {}",
+                                stream_id,
+                                err
+                            );
                         }
                     }
                 }
@@ -414,13 +414,10 @@ impl AlsaBackend {
                         msg.code = VIRTIO_SND_S_BAD_MSG;
                         continue;
                     };
-                    if let Err(err) = streams.write().unwrap()[stream_id].state.release() {
-                        log::error!("Stream {} release {}", stream_id, err);
-                        msg.code = VIRTIO_SND_S_BAD_MSG;
-                    }
                     senders[stream_id].send(false).unwrap();
-                    let mut streams = streams.write().unwrap();
-                    std::mem::take(&mut streams[stream_id].buffers);
+                    let mut streams_lck = streams.write().unwrap();
+                    streams_lck[stream_id].state.release();
+                    std::mem::take(&mut streams_lck[stream_id].buffers);
                 }
                 AlsaAction::SetParameters(stream_id, mut msg) => {
                     if stream_id >= streams_no {
@@ -443,14 +440,10 @@ impl AlsaBackend {
                     {
                         let mut streams = streams.write().unwrap();
                         let st = &mut streams[stream_id];
-                        if let Err(err) = st.state.set_parameters() {
-                            log::error!("Stream {} set_parameters {}", stream_id, err);
-                            msg.code = VIRTIO_SND_S_BAD_MSG;
-                            continue;
-                        } else if !st.supports_format(request.format)
-                            || !st.supports_rate(request.rate)
-                        {
+                        st.state.set_parameters();
+                        if !st.supports_format(request.format) || !st.supports_rate(request.rate) {
                             msg.code = VIRTIO_SND_S_NOT_SUPP;
+                            // Drop `msg` and skip `update_pcm`
                             continue;
                         } else {
                             st.params.buffer_bytes = request.buffer_bytes;

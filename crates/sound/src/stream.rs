@@ -17,8 +17,6 @@ pub enum Error {
     InvalidStreamId(u32),
 }
 
-type Result<T> = std::result::Result<T, Error>;
-
 /// PCM stream state machine.
 ///
 /// ## 5.14.6.6.1 PCM Command Lifecycle
@@ -106,12 +104,11 @@ pub enum PCMState {
 
 macro_rules! set_new_state {
     ($new_state_fn:ident, $new_state:expr, $($valid_source_states:tt)*) => {
-        pub fn $new_state_fn(&mut self) -> Result<()> {
-            if !matches!(self, $($valid_source_states)*) {
-                return Err(Error::InvalidStateTransition(*self, $new_state));
+        pub fn $new_state_fn(&mut self) {
+            if !matches!(*self, $($valid_source_states)*) {
+                log::error!("{}", Error::InvalidStateTransition(*self, $new_state));
             }
             *self = $new_state;
-            Ok(())
         }
     };
 }
